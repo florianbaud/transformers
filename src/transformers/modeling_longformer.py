@@ -31,9 +31,11 @@ from .modeling_roberta import RobertaLMHead, RobertaModel
 logger = logging.getLogger(__name__)
 
 LONGFORMER_PRETRAINED_MODEL_ARCHIVE_MAP = {
-    "longformer-base-4096": "https://s3.amazonaws.com/models.huggingface.co/bert/allenai/longformer-base-4096/pytorch_model.bin",
-    "longformer-large-4096": "https://s3.amazonaws.com/models.huggingface.co/bert/allenai/longformer-large-4096/pytorch_model.bin",
-    "longformer-large-4096-finetuned-triviaqa": "https://s3.amazonaws.com/models.huggingface.co/bert/allenai/longformer-large-4096-finetuned-triviaqa/pytorch_model.bin",
+    "allenai/longformer-base-4096": "https://s3.amazonaws.com/models.huggingface.co/bert/allenai/longformer-base-4096/pytorch_model.bin",
+    "allenai/longformer-large-4096": "https://s3.amazonaws.com/models.huggingface.co/bert/allenai/longformer-large-4096/pytorch_model.bin",
+    "allenai/longformer-large-4096-finetuned-triviaqa": "https://s3.amazonaws.com/models.huggingface.co/bert/allenai/longformer-large-4096-finetuned-triviaqa/pytorch_model.bin",
+    "allenai/longformer-base-4096-extra.pos.embd.only": "https://s3.amazonaws.com/models.huggingface.co/bert/allenai/longformer-base-4096-extra.pos.embd.only/pytorch_model.bin",
+    "allenai/longformer-large-4096-extra.pos.embd.only": "https://s3.amazonaws.com/models.huggingface.co/bert/allenai/longformer-large-4096-extra.pos.embd.only/pytorch_model.bin",
 }
 
 
@@ -257,9 +259,17 @@ class LongformerSelfAttention(nn.Module):
 
         q = q.view(seqlen, batch_size, self.num_heads, self.head_dim).transpose(0, 1)
         k = k.view(seqlen, batch_size, self.num_heads, self.head_dim).transpose(0, 1)
-        # attn_weights = (batch_size, seqlen, num_heads, window*2+1)
-        attn_weights = self._sliding_chunks_matmul_qk(q, k, self.one_sided_attention_window_size)
-        self._mask_invalid_locations(attn_weights, self.one_sided_attention_window_size)
+        if seqlen < 2 * self.one_sided_attention_window_size:  # full n^2 attention for short seqlen
+            remove_from_windowed_attention_mask = None
+            extra_attention_mask = None
+            attn_weights = torch.einsum("blhd,bshd->blhs", (q, k))
+            if key_padding_mask is not None:
+                attn_weights = attn_weights.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), -10000.0,)
+        else:
+            # attn_weights = (batch_size, seqlen, num_heads, window*2+1)
+            attn_weights = self._sliding_chunks_matmul_qk(q, k, self.one_sided_attention_window_size)
+            self._mask_invalid_locations(attn_weights, self.one_sided_attention_window_size)
+
         if remove_from_windowed_attention_mask is not None:
             # This implementation is fast and takes very little memory because num_heads x hidden_size = 1
             # from (batch_size x seqlen) to (batch_size x seqlen x num_heads x hidden_size)
@@ -274,12 +284,21 @@ class LongformerSelfAttention(nn.Module):
             # diagonal mask with zeros everywhere and -inf inplace of padding
             d_mask = self._sliding_chunks_matmul_qk(ones, float_mask, self.one_sided_attention_window_size)
             attn_weights += d_mask
-        assert list(attn_weights.size()) == [
-            batch_size,
-            seqlen,
-            self.num_heads,
-            self.one_sided_attention_window_size * 2 + 1,
-        ]
+
+        if seqlen < 2 * self.one_sided_attention_window_size:  # full n^2 attention for short seqlen
+            assert list(attn_weights.size()) == [
+                batch_size,
+                seqlen,
+                self.num_heads,
+                seqlen,
+            ]
+        else:
+            assert list(attn_weights.size()) == [
+                batch_size,
+                seqlen,
+                self.num_heads,
+                self.one_sided_attention_window_size * 2 + 1,
+            ]
 
         # the extra attention
         if extra_attention_mask is not None:
@@ -314,7 +333,9 @@ class LongformerSelfAttention(nn.Module):
             attn_probs = attn_probs.narrow(
                 -1, max_num_extra_indices_per_batch, attn_probs.size(-1) - max_num_extra_indices_per_batch
             ).contiguous()
-        if attn is None:
+        if seqlen < 2 * self.one_sided_attention_window_size:  # full n^2 attention for short seqlen
+            attn = torch.einsum('blhs,bshd->blhd', (attn_probs, v))
+        elif attn is None:
             attn = self._sliding_chunks_matmul_pv(attn_probs, v, self.one_sided_attention_window_size)
         else:
             attn += self._sliding_chunks_matmul_pv(attn_probs, v, self.one_sided_attention_window_size)
@@ -509,7 +530,7 @@ class LongformerModel(RobertaModel):
         batch_size, seqlen = input_shape[:2]
 
         padding_len = (attention_window - seqlen % attention_window) % attention_window
-        if padding_len > 0:
+        if padding_len > 0 and seqlen > attention_window:  # don't pad short sequences
             logger.info(
                 "Input ids are automatically padded from {} to {} to be a multiple of `config.attention_window`: {}".format(
                     seqlen, seqlen + padding_len, attention_window
@@ -532,6 +553,8 @@ class LongformerModel(RobertaModel):
                 )
                 inputs_embeds_padding = self.embeddings(input_ids_padding)
                 inputs_embeds = torch.cat([inputs_embeds, inputs_embeds_padding], dim=-2)
+        else:
+            padding_len = 0
 
         return padding_len, input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds
 
@@ -736,8 +759,7 @@ class LongformerForQuestionAnswering(BertPreTrainedModel):
         attention_mask = torch.arange(input_ids.shape[1], device=input_ids.device)
         attention_mask = attention_mask.expand_as(input_ids) < question_end_index
 
-        attention_mask = attention_mask.int() + 1  # True => global attention; False => local attention
-        return attention_mask.long()
+        return attention_mask.long() + 1  # True => global attention; False => local attention
 
     def _get_question_end_index(self, input_ids):
         sep_token_indices = (input_ids == self.config.sep_token_id).nonzero()
