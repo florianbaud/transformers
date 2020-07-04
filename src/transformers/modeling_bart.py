@@ -319,25 +319,19 @@ class BartEncoder(nn.Module):
             if self.training and (dropout_probability < self.layerdrop):  # skip the layer
                 attn = None
             else:
-                output_attentions = True
                 if getattr(self.config, 'gradient_checkpointing', False):
-                    def none_to_empty(x):
-                        return x if x is not None else torch.empty(0)
-
-                    def empty_to_none(x):
-                        return None if x.size() == torch.Size((0,)) else x
+                    assert not output_attentions
+                    attn = None
 
                     def create_custom_forward(module):
                         def custom_forward(*inputs):
-                            rets = module(*inputs, output_attentions=output_attentions)
-                            return tuple(none_to_empty(x) for x in rets)
+                            val, _ = module(*inputs, output_attentions=False)
+                            return val
                         return custom_forward
-
-                    vals = torch.utils.checkpoint.checkpoint(
+                    x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(encoder_layer),
                         x, attention_mask,
                     )
-                    x, attn = [empty_to_none(x) for x in vals]
                 else:
                     x, attn = encoder_layer(x, attention_mask, output_attentions=output_attentions)
 
