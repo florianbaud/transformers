@@ -282,6 +282,7 @@ class BartEncoder(nn.Module):
 
     def __init__(self, config: BartConfig, embed_tokens):
         super().__init__()
+        self.config = config
 
         self.dropout = config.dropout
         self.layerdrop = config.encoder_layerdrop
@@ -349,7 +350,21 @@ class BartEncoder(nn.Module):
             if self.training and (dropout_probability < self.layerdrop):  # skip the layer
                 attn = None
             else:
-                x, attn = encoder_layer(x, attention_mask, output_attentions=output_attentions)
+                if getattr(self.config, 'gradient_checkpointing', False):
+                    assert not output_attentions
+                    attn = None
+
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            val, _ = module(*inputs, output_attentions=False)
+                            return val
+                        return custom_forward
+                    x = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(encoder_layer),
+                        x, attention_mask,
+                    )
+                else:
+                    x, attn = encoder_layer(x, attention_mask, output_attentions=output_attentions)
 
             if output_attentions:
                 all_attentions = all_attentions + (attn,)
@@ -472,6 +487,7 @@ class BartDecoder(nn.Module):
 
     def __init__(self, config: BartConfig, embed_tokens: nn.Embedding):
         super().__init__()
+        self.config = config
         self.dropout = config.dropout
         self.layerdrop = config.decoder_layerdrop
         self.padding_idx = embed_tokens.padding_idx
@@ -576,15 +592,37 @@ class BartDecoder(nn.Module):
 
             layer_state = past_key_values[idx] if past_key_values is not None else None
 
-            x, layer_self_attn, layer_past = decoder_layer(
-                x,
-                encoder_hidden_states,
-                encoder_attn_mask=encoder_padding_mask,
-                decoder_padding_mask=decoder_padding_mask,
-                layer_state=layer_state,
-                causal_mask=decoder_causal_mask,
-                output_attentions=output_attentions,
-            )
+            if getattr(self.config, 'gradient_checkpointing', False):
+                assert not output_attentions
+                assert not use_cache
+                layer_self_attn = None
+                layer_past = None
+
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        val, _, _ = module(*inputs, output_attentions=False)
+                        return val
+                    return custom_forward
+
+                x = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(decoder_layer),
+                    x,
+                    encoder_hidden_states,
+                    encoder_padding_mask,
+                    layer_state,
+                    decoder_causal_mask,
+                    decoder_padding_mask,
+                )
+            else:
+                x, layer_self_attn, layer_past = decoder_layer(
+                    x,
+                    encoder_hidden_states,
+                    encoder_attn_mask=encoder_padding_mask,
+                    layer_state=layer_state,
+                    causal_mask=decoder_causal_mask,
+                    decoder_padding_mask=decoder_padding_mask,
+                    output_attentions=output_attentions,
+                )
 
             if use_cache:
                 next_decoder_cache.append(layer_past.copy())
