@@ -141,7 +141,7 @@ class LongformerSelfAttention(nn.Module):
     @staticmethod
     def _unfold_loop(x, size, step):
         seqlen = x.size(1)
-        num_chunks = (seqlen - size)// step + 1
+        num_chunks = (seqlen - size) // step + 1
         chunks = [x.narrow(1, i * step, size) for i in range(num_chunks)]
         return torch.stack(chunks, dim=1)
 
