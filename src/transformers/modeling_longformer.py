@@ -27,6 +27,12 @@ from .file_utils import add_start_docstrings, add_start_docstrings_to_callable
 from .modeling_bert import BertPreTrainedModel
 from .modeling_roberta import RobertaLMHead, RobertaModel
 
+try:
+    import torch_xla.core.xla_model as xm
+except ImportError:
+    XLA_AVAILABLE = False
+else:
+    XLA_AVAILABLE = True
 
 logger = logging.getLogger(__name__)
 
@@ -133,9 +139,15 @@ class LongformerSelfAttention(nn.Module):
         return x
 
     @staticmethod
+    def _unfold_loop(x, size, step):
+        seqlen = x.size(1)
+        num_chunks = (seqlen - size)// step + 1
+        chunks = [x.narrow(1, i * step, size) for i in range(num_chunks)]
+        return torch.stack(chunks, dim=1)
+
+    @staticmethod
     def _chunk(x, w):
         """convert into overlapping chunkings. Chunk size = 2w, overlap size = w"""
-
         # non-overlapping chunks of size = 2w
         x = x.view(x.size(0), x.size(1) // (w * 2), w * 2, x.size(2))
 
@@ -174,8 +186,12 @@ class LongformerSelfAttention(nn.Module):
         q = q.transpose(1, 2).reshape(batch_size * num_heads, seqlen, head_dim)
         k = k.transpose(1, 2).reshape(batch_size * num_heads, seqlen, head_dim)
 
-        chunk_q = self._chunk(q, w)
-        chunk_k = self._chunk(k, w)
+        if XLA_AVAILABLE:
+            chunk_q = self._unfold_loop(q, 2 * w, w)
+            chunk_k = self._unfold_loop(k, 2 * w, w)
+        else:
+            chunk_q = self._chunk(q, w)
+            chunk_k = self._chunk(k, w)
 
         # matrix multipication
         # bcxd: batch_size * num_heads x chunks x 2w x head_dim
@@ -225,10 +241,13 @@ class LongformerSelfAttention(nn.Module):
         padded_v = F.pad(v, (0, 0, w, w), value=-1)
 
         # chunk padded_v into chunks of size 3w and an overlap of size w
-        chunk_v_size = (batch_size * num_heads, chunks_count + 1, 3 * w, head_dim)
-        chunk_v_stride = padded_v.stride()
-        chunk_v_stride = chunk_v_stride[0], w * chunk_v_stride[1], chunk_v_stride[1], chunk_v_stride[2]
-        chunk_v = padded_v.as_strided(size=chunk_v_size, stride=chunk_v_stride)
+        if XLA_AVAILABLE:
+            chunk_v = self._unfold_loop(padded_v, 3 * w, w)
+        else:
+            chunk_v_size = (batch_size * num_heads, chunks_count + 1, 3 * w, head_dim)
+            chunk_v_stride = padded_v.stride()
+            chunk_v_stride = chunk_v_stride[0], w * chunk_v_stride[1], chunk_v_stride[1], chunk_v_stride[2]
+            chunk_v = padded_v.as_strided(size=chunk_v_size, stride=chunk_v_stride)
 
         skewed_prob = self._skew2(chunk_prob)
 
@@ -257,6 +276,9 @@ class LongformerSelfAttention(nn.Module):
         # TODO: add support for `encoder_hidden_states` and `encoder_attention_mask`
         assert encoder_hidden_states is None, "`encoder_hidden_states` is not supported and should be None"
         assert encoder_attention_mask is None, "`encoder_attention_mask` is not supported and shiould be None"
+
+        if XLA_AVAILABLE:
+            attention_mask = None  # disable global attention and masking for TPUs
 
         if attention_mask is not None:
             attention_mask = attention_mask.squeeze(dim=2).squeeze(dim=1)
