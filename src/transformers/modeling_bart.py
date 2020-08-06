@@ -299,7 +299,7 @@ class BartEncoder(nn.Module):
         """
         # check attention mask and invert
         if attention_mask is not None:
-            attention_mask = invert_mask(attention_mask)
+            attention_mask = 1 - attention_mask
 
         inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
         embed_pos = self.embed_positions(input_ids)
