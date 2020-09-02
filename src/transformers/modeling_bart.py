@@ -592,7 +592,7 @@ class BartDecoder(nn.Module):
 
             layer_state = past_key_values[idx] if past_key_values is not None else None
 
-            if getattr(self.config, 'gradient_checkpointing', False):
+            if getattr(self.config, 'gradient_checkpointing', False) and not use_cache:
                 assert not output_attentions
                 assert not use_cache
                 layer_self_attn = None
@@ -926,7 +926,6 @@ class BartModel(PretrainedBartModel):
 
         if decoder_input_ids is None:
             use_cache = False
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
