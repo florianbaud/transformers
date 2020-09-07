@@ -290,8 +290,8 @@ class BartEncoder(nn.Module):
         embed_dim = embed_tokens.embedding_dim
         self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
         self.padding_idx = embed_tokens.padding_idx
-        self.max_source_positions = getattr(config, 'max_encoder_position_embeddings', config.max_position_embeddings)
 
+        self.max_source_positions = getattr(config, 'max_encoder_position_embeddings', config.max_position_embeddings)
         self.embed_tokens = embed_tokens
         if config.static_position_embeddings:
             self.embed_positions = SinusoidalPositionalEmbedding(
@@ -299,7 +299,7 @@ class BartEncoder(nn.Module):
             )
         else:
             self.embed_positions = LearnedPositionalEmbedding(
-                config.max_position_embeddings,
+                self.max_source_positions,
                 embed_dim,
                 self.padding_idx,
                 config.extra_pos_embeddings,
@@ -500,7 +500,7 @@ class BartDecoder(nn.Module):
             )
         else:
             self.embed_positions = LearnedPositionalEmbedding(
-                config.max_position_embeddings,
+                self.max_target_positions,
                 config.d_model,
                 self.padding_idx,
                 config.extra_pos_embeddings,
